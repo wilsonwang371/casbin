@@ -17,6 +17,7 @@ package util
 import (
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"net"
 	"path"
 	"regexp"
@@ -29,6 +30,8 @@ import (
 
 var (
 	keyMatch4Re *regexp.Regexp = regexp.MustCompile(`{([^/]+)}`)
+
+	memorizedMapShards = 32
 )
 
 // validate the variadic parameter size and type as string
@@ -368,7 +371,11 @@ func GlobMatchFunc(args ...interface{}) (interface{}, error) {
 
 // GenerateGFunction is the factory method of the g(_, _[, _]) function.
 func GenerateGFunction(rm rbac.RoleManager) govaluate.ExpressionFunction {
-	memorized := sync.Map{}
+	memorized := []sync.Map{}
+	for i := 0; i < memorizedMapShards; i++ {
+		memorized = append(memorized, sync.Map{})
+	}
+
 	return func(args ...interface{}) (interface{}, error) {
 		// Like all our other govaluate functions, all args are strings.
 
@@ -385,9 +392,16 @@ func GenerateGFunction(rm rbac.RoleManager) govaluate.ExpressionFunction {
 			builder.WriteString(arg.(string))
 		}
 		key := builder.String()
+		// ...and hash it.
+		var shadId int
+		hasher := fnv.New32a()
+		if _, err := hasher.Write([]byte(key)); err != nil {
+			shadId = 0
+		}
+		shadId = int(hasher.Sum32() % uint32(memorizedMapShards))
 
 		// ...and see if we've already calculated this.
-		v, found := memorized.Load(key)
+		v, found := memorized[shadId].Load(key)
 		if found {
 			return v, nil
 		}
@@ -404,7 +418,7 @@ func GenerateGFunction(rm rbac.RoleManager) govaluate.ExpressionFunction {
 			v, _ = rm.HasLink(name1, name2, domain)
 		}
 
-		memorized.Store(key, v)
+		memorized[shadId].Store(key, v)
 		return v, nil
 	}
 }
