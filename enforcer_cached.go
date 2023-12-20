@@ -15,6 +15,7 @@
 package casbin
 
 import (
+	"hash/fnv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -22,13 +23,15 @@ import (
 	"github.com/casbin/casbin/v2/persist/cache"
 )
 
+var shardPartitions = 32
+
 // CachedEnforcer wraps Enforcer and provides decision cache
 type CachedEnforcer struct {
 	*Enforcer
 	expireTime  uint
-	cache       cache.Cache
+	cache       []cache.Cache
 	enableCache int32
-	locker      *sync.RWMutex
+	locker      []*sync.RWMutex
 }
 
 type CacheableParam interface {
@@ -45,9 +48,11 @@ func NewCachedEnforcer(params ...interface{}) (*CachedEnforcer, error) {
 	}
 
 	e.enableCache = 1
-	cache := cache.DefaultCache(make(map[string]bool))
-	e.cache = &cache
-	e.locker = new(sync.RWMutex)
+	for i := 0; i < shardPartitions; i++ {
+		e.locker = append(e.locker, new(sync.RWMutex))
+		cache := cache.DefaultCache(make(map[string]bool))
+		e.cache = append(e.cache, &cache)
+	}
 	return e, nil
 }
 
@@ -89,18 +94,29 @@ func (e *CachedEnforcer) Enforce(rvals ...interface{}) (bool, error) {
 
 func (e *CachedEnforcer) LoadPolicy() error {
 	if atomic.LoadInt32(&e.enableCache) != 0 {
-		if err := e.cache.Clear(); err != nil {
-			return err
+		for i := 0; i < shardPartitions; i++ {
+			if err := e.cache[i].Clear(); err != nil {
+				return err
+			}
 		}
 	}
 	return e.Enforcer.LoadPolicy()
+}
+
+func getShardIdx(s string) int {
+	h := fnv.New32a()
+	if _, err := h.Write([]byte(s)); err != nil {
+		return 0
+	}
+	return int(h.Sum32()) % shardPartitions
 }
 
 func (e *CachedEnforcer) RemovePolicy(params ...interface{}) (bool, error) {
 	if atomic.LoadInt32(&e.enableCache) != 0 {
 		key, ok := e.getKey(params...)
 		if ok {
-			if err := e.cache.Delete(key); err != nil && err != cache.ErrNoSuchKey {
+			idx := getShardIdx(key)
+			if err := e.cache[idx].Delete(key); err != nil && err != cache.ErrNoSuchKey {
 				return false, err
 			}
 		}
@@ -117,7 +133,8 @@ func (e *CachedEnforcer) RemovePolicies(rules [][]string) (bool, error) {
 					irule[i] = param
 				}
 				key, _ := e.getKey(irule...)
-				if err := e.cache.Delete(key); err != nil && err != cache.ErrNoSuchKey {
+				idx := getShardIdx(key)
+				if err := e.cache[idx].Delete(key); err != nil && err != cache.ErrNoSuchKey {
 					return false, err
 				}
 			}
@@ -127,23 +144,26 @@ func (e *CachedEnforcer) RemovePolicies(rules [][]string) (bool, error) {
 }
 
 func (e *CachedEnforcer) getCachedResult(key string) (res bool, err error) {
-	e.locker.RLock()
-	defer e.locker.RUnlock()
-	return e.cache.Get(key)
+	idx := getShardIdx(key)
+	e.locker[idx].RLock()
+	defer e.locker[idx].RUnlock()
+	return e.cache[idx].Get(key)
 }
 
 func (e *CachedEnforcer) SetExpireTime(expireTime uint) {
 	e.expireTime = expireTime
 }
 
-func (e *CachedEnforcer) SetCache(c cache.Cache) {
-	e.cache = c
+func (e *CachedEnforcer) SetCache(key string, c cache.Cache) {
+	idx := getShardIdx(key)
+	e.cache[idx] = c
 }
 
 func (e *CachedEnforcer) setCachedResult(key string, res bool, extra ...interface{}) error {
-	e.locker.Lock()
-	defer e.locker.Unlock()
-	return e.cache.Set(key, res, extra...)
+	idx := getShardIdx(key)
+	e.locker[idx].Lock()
+	defer e.locker[idx].Unlock()
+	return e.cache[idx].Set(key, res, extra...)
 }
 
 func (e *CachedEnforcer) getKey(params ...interface{}) (string, bool) {
@@ -164,7 +184,12 @@ func (e *CachedEnforcer) getKey(params ...interface{}) (string, bool) {
 
 // InvalidateCache deletes all the existing cached decisions.
 func (e *CachedEnforcer) InvalidateCache() error {
-	e.locker.Lock()
-	defer e.locker.Unlock()
-	return e.cache.Clear()
+	for i := 0; i < shardPartitions; i++ {
+		e.locker[i].Lock()
+		defer e.locker[i].Unlock()
+		if err := e.cache[i].Clear(); err != nil {
+			return err
+		}
+	}
+	return nil
 }
