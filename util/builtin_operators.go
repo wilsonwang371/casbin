@@ -31,7 +31,7 @@ import (
 var (
 	keyMatch4Re *regexp.Regexp = regexp.MustCompile(`{([^/]+)}`)
 
-	memorizedMapShards = 64
+	memorizedMapShards = 120
 )
 
 // validate the variadic parameter size and type as string
